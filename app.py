@@ -1,10 +1,19 @@
-from flask import Flask, Response, send_file
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
 import os
-from flask_cors import CORS
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins
+app = FastAPI()
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (adjust as needed for production)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Directory for storing audio chunks
 CHUNK_DIR = "audio_chunks"
@@ -26,9 +35,9 @@ def save_chunk_to_local(chunk, filename):
     return file_path
 
 # Streaming endpoint
-@app.route('/stream-audio', methods=['GET'])
-def stream_audio():
-    def generate():
+@app.get("/stream-audio")
+async def stream_audio():
+    async def generate():
         # Load and chunk audio
         audio = load_audio("audio.mp3")
         chunks = generate_chunks(audio)
@@ -39,16 +48,17 @@ def stream_audio():
             chunk_url = f"http://localhost:5000/get-chunk/{filename}"
             yield f"data: {chunk_url}\n\n"
 
-    return Response(generate(), mimetype='text/event-stream')
+    return StreamingResponse(generate(), media_type='text/event-stream')
 
 # Endpoint to access chunk audio
-@app.route('/get-chunk/<filename>', methods=['GET'])
-def get_chunk(filename):
+@app.get("/get-chunk/{filename}")
+async def get_chunk(filename: str):
     file_path = os.path.join(CHUNK_DIR, filename)
     if os.path.exists(file_path):
-        return send_file(file_path, mimetype="audio/mp3")
+        return StreamingResponse(open(file_path, "rb"), media_type="audio/mp3")
     else:
-        return "File not found", 404
+        raise HTTPException(status_code=404, detail="File not found")
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    import uvicorn
+    uvicorn.run(app, host="localhost", port=5000, log_level="debug")
