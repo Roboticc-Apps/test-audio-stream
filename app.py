@@ -1,11 +1,18 @@
 import asyncio
+import os
+import logging
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
-import os
-import logging
 import httpx
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Access the DID API key from environment variables
+DID_KEY = os.getenv('DID_API_KEY')
 
 app = FastAPI()
 
@@ -17,9 +24,6 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all methods
     allow_headers=["*"],  # Allow all headers
 )
-
-# D-ID API Basic Auth key
-DID_KEY = "bmlja211aXJAeTdtYWlsLmNvbQ:PcR5zmW86VDsTLfdPwvJz"
 
 # Directory for storing audio chunks
 CHUNK_DIR = "audio_chunks"
@@ -67,7 +71,7 @@ async def stream_audio(request: Request, body: dict = Body(...)):
                 chunk_url = f"{host_url}/get-chunk/{filename}"
                 logging.debug(f"Generated chunk URL: {chunk_url}")
 
-                # Add delay 3 seconds between chunks
+                # Add delay 10 seconds between chunks
                 await asyncio.sleep(10)
 
                 # Request body with session_id
