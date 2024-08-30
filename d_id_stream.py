@@ -1,8 +1,17 @@
 import asyncio
 import random
 import os
+import cv2
+import numpy as np
 from aiohttp import ClientSession, ClientResponseError
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc import (
+    RTCPeerConnection, 
+    RTCSessionDescription, 
+    RTCConfiguration, 
+    RTCIceServer, 
+    MediaStreamTrack
+)
+from aiortc.contrib.media import MediaRecorder
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -89,7 +98,7 @@ async def connect():
             adjusted_sdp = adjust_sdp(data['offer']['sdp'])
             offer = RTCSessionDescription(sdp=adjusted_sdp, type=data['offer']['type'])
 
-            ice_servers = [RTCIceServer(ice.get('urls'), ice.get('username'), ice.get('credential')) for ice in data['ice_servers']]
+            ice_servers = [RTCIceServer(ice.get('urls'), ice.get('username'), ice.get('credential'), None) for ice in data['ice_servers']]
 
             try:
                 session_client_answer = await create_peer_connection(offer, ice_servers)
@@ -115,6 +124,9 @@ async def connect():
                 print("Successfully sent SDP answer to service")
             except Exception as e:
                 print('Error sending SDP answer to service:', e)
+
+            print('Stream ID:', stream_id)
+            print('Session ID:', session_id)
 
         except Exception as e:
             print('Error connecting to service:', e)
@@ -194,10 +206,26 @@ async def create_peer_connection(offer, ice_servers):
         print(f"Signaling state changed: {peer_connection.signalingState}")
 
     @peer_connection.on('track')
-    def on_track(track):
+    async def on_track(track: MediaStreamTrack):
         print(f"Received track: {track.kind}")
         if track.kind == "video":
             print("Video track received")
+            # Create a media recorder to handle incoming video frames
+            recorder = MediaRecorder("output.mp4")  # Save video to a file if needed
+            await recorder.start()
+            try:
+                while True:
+                    frame = await track.recv()
+                    # Convert frame to numpy array
+                    img = frame.to_ndarray(format="bgr24")
+                    # Display using OpenCV
+                    cv2.imshow("Video Frame", img)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+            except Exception as e:
+                print(f"Error receiving frame: {e}")
+            finally:
+                await recorder.stop()
 
     @pc_data_channel.on('message')
     def on_message(message):
@@ -236,6 +264,10 @@ async def close_pc():
         await peer_connection.close()
         peer_connection = None
 
-if __name__ == '__main__':
-    asyncio.run(connect())
-    # asyncio.run(destroy())
+async def main():
+    await connect()
+    await asyncio.sleep(300)  # Keep running for some time to allow viewing frames
+    await destroy()
+
+if __name__ == "__main__":
+    asyncio.run(main())
