@@ -52,9 +52,11 @@ async def fetch_with_retries(session, url, method='GET', json_data=None, retries
     except (ClientResponseError, asyncio.TimeoutError) as e:
         if retries <= 3:
             delay = min(2 ** retries / 4 + random.random(), 4)  # Exponential backoff
+            print(f"Retrying request to {url} (attempt {retries+1})")
             await asyncio.sleep(delay)
             return await fetch_with_retries(session, url, method, json_data, retries + 1)
         else:
+            print(f"Failed to fetch {url} after {retries} attempts")
             raise e
 
 async def connect():
@@ -82,7 +84,11 @@ async def connect():
             data = response
             stream_id = data['id']
             session_id = data['session_id']
-            offer = RTCSessionDescription(data['offer']['sdp'], data['offer']['type'])
+
+            # Adjust the SDP offer for codec compatibility
+            adjusted_sdp = adjust_sdp(data['offer']['sdp'])
+            offer = RTCSessionDescription(sdp=adjusted_sdp, type=data['offer']['type'])
+
             ice_servers = [RTCIceServer(ice.get('urls'), ice.get('username'), ice.get('credential')) for ice in data['ice_servers']]
 
             try:
@@ -99,10 +105,14 @@ async def connect():
                     f"{DID_API['url']}/{DID_API['service']}/streams/{stream_id}/sdp",
                     'POST',
                     {
-                        'answer': session_client_answer.sdp,
+                        'answer': {
+                            'sdp': session_client_answer.sdp,
+                            'type': session_client_answer.type
+                        },
                         'session_id': session_id
                     }
                 )
+                print("Successfully sent SDP answer to service")
             except Exception as e:
                 print('Error sending SDP answer to service:', e)
 
@@ -111,99 +121,107 @@ async def connect():
 
 async def destroy():
     async with ClientSession() as session:
-        await fetch_with_retries(
-            session,
-            f"{DID_API['url']}/{DID_API['service']}/streams/{stream_id}",
-            'DELETE',
-            {'session_id': session_id}
-        )
+        try:
+            await fetch_with_retries(
+                session,
+                f"{DID_API['url']}/{DID_API['service']}/streams/{stream_id}",
+                'DELETE',
+                {'session_id': session_id}
+            )
+            print("Successfully destroyed stream")
+        except Exception as e:
+            print(f"Error destroying stream: {e}")
     await stop_all_streams()
     await close_pc()
 
+# Function to adjust SDP to ensure compatibility with aiortc
+def adjust_sdp(sdp):
+    # Example adjustment: replace H264 with VP8, which is widely supported by aiortc
+    sdp = sdp.replace('H264/90000', 'VP8/90000')
+    # Additional adjustments can be made here if needed
+    return sdp
+
 async def create_peer_connection(offer, ice_servers):
     global peer_connection, pc_data_channel
-    peer_connection = RTCPeerConnection(RTCConfiguration(ice_servers))
+    config = RTCConfiguration(ice_servers)
+    peer_connection = RTCPeerConnection(config)
 
     pc_data_channel = peer_connection.createDataChannel('JanusDataChannel')
 
-    peer_connection.on('icegatheringstatechange', on_ice_gathering_state_change)
-    peer_connection.on('icecandidate', on_ice_candidate)
-    peer_connection.on('iceconnectionstatechange', on_ice_connection_state_change)
-    peer_connection.on('connectionstatechange', on_connection_state_change)
-    peer_connection.on('signalingstatechange', on_signaling_state_change)
-    peer_connection.on('track', on_track)
-    pc_data_channel.on('message', on_stream_event)
-    print('Created peer connection OK')
+    @peer_connection.on('icegatheringstatechange')
+    def on_ice_gathering_state_change():
+        print(f"ICE gathering state changed: {peer_connection.iceGatheringState}")
+
+    @peer_connection.on('icecandidate')
+    async def on_ice_candidate(event):
+        if event.candidate:
+            print('Received ICE candidate')
+            candidate = event.candidate.candidate
+            sdp_mid = event.candidate.sdpMid
+            sdp_mline_index = event.candidate.sdpMLineIndex
+
+            url = f"{DID_API['url']}/{DID_API['service']}/streams/{stream_id}/ice"
+            body = {
+                'candidate': candidate,
+                'sdpMid': sdp_mid,
+                'sdpMLineIndex': sdp_mline_index,
+                'session_id': session_id,
+            }
+
+            async with ClientSession() as session:
+                try:
+                    await fetch_with_retries(session, url, 'POST', body)
+                    print("Successfully sent ICE candidate to service")
+                except Exception as e:
+                    print(f"Error sending ICE candidate: {e}")
+        else:
+            print('Received null ICE candidate.')
+
+    @peer_connection.on('iceconnectionstatechange')
+    async def on_ice_connection_state_change():
+        print(f"ICE connection state changed: {peer_connection.iceConnectionState}")
+        if peer_connection.iceConnectionState in ['failed', 'closed']:
+            print("ICE connection failed or closed")
+            await stop_all_streams()
+            await close_pc()
+
+    @peer_connection.on('connectionstatechange')
+    def on_connection_state_change():
+        print(f"Connection state changed: {peer_connection.connectionState}")
+
+    @peer_connection.on('signalingstatechange')
+    def on_signaling_state_change():
+        print(f"Signaling state changed: {peer_connection.signalingState}")
+
+    @peer_connection.on('track')
+    def on_track(track):
+        print(f"Received track: {track.kind}")
+        if track.kind == "video":
+            print("Video track received")
+
+    @pc_data_channel.on('message')
+    def on_message(message):
+        print(f"Data channel message received: {message}")
+
+    print('Created peer connection')
 
     try:
         await peer_connection.setRemoteDescription(offer)
-        print('Set remote SDP OK')
+        print('Set remote SDP')
     except Exception as e:
         print('Failed to set remote SDP:', e)
         raise e
 
     try:
-        session_client_answer = await peer_connection.createAnswer()
-        print('Created local SDP OK')
-        await peer_connection.setLocalDescription(session_client_answer)
-        print('Set local SDP OK')
+        answer = await peer_connection.createAnswer()
+        print('Created local SDP')
+        await peer_connection.setLocalDescription(answer)
+        print('Set local SDP')
     except Exception as e:
         print('Error creating or setting local SDP:', e)
         raise e
 
-    return session_client_answer
-
-def on_ice_gathering_state_change():
-    print(f"ICE gathering state changed: {peer_connection.iceGatheringState}")
-
-async def on_ice_candidate(event):
-    print('Received ICE candidate')
-    if event.candidate:
-        candidate = event.candidate.get('candidate')
-        sdp_mid = event.candidate.get('sdpMid')
-        sdp_mline_index = event.candidate.get('sdpMLineIndex')
-
-        url = f"https://api.d-id.com/{DID_API['service']}/streams/{stream_id}/ice"
-        body = {
-            'candidate': candidate,
-            'sdpMid': sdp_mid,
-            'sdpMLineIndex': sdp_mline_index,
-            'session_id': session_id,
-        }
-
-        async with ClientSession() as session:
-            try:
-                await fetch_with_retries(
-                    session,
-                    url,
-                    'POST',
-                    body
-                )
-            except Exception as e:
-                print(f"Error sending ICE candidate: {e}")
-    else:
-        # Handle null ICE candidate for initial 2 sec idle stream
-        print('Received null ICE candidate.')
-
-def on_ice_connection_state_change():
-    if peer_connection.iceConnectionState in ['failed', 'closed']:
-        asyncio.create_task(stop_all_streams())
-        asyncio.create_task(close_pc())
-
-def on_connection_state_change():
-    # Handle connection state change
-    pass
-
-def on_signaling_state_change():
-    print(f"Signaling state changed: {peer_connection.signalingState}")
-
-def on_track(event):
-    # Handle track event
-    pass
-
-def on_stream_event(message):
-    # Handle stream events
-    pass
+    return answer
 
 async def stop_all_streams():
     global stream_video_opacity
@@ -214,8 +232,8 @@ async def stop_all_streams():
 async def close_pc():
     global peer_connection
     if peer_connection:
-        print('Stopping peer connection')
-        await peer_connection.close()  # Tambahkan await di sini
+        print('Closing peer connection')
+        await peer_connection.close()
         peer_connection = None
 
 if __name__ == '__main__':
